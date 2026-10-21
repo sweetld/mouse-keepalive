@@ -4,6 +4,8 @@ Moves the mouse pointer a few pixels now and then while you're away, so screensa
 
 It's a single Python file, `keepalive.py`, that runs on Windows and macOS. It needs Python 3.8 or later and nothing else.
 
+**Download:** get the latest `mouse-keepalive-<version>.zip` from [Releases](https://github.com/sweetld/mouse-keepalive/releases/latest) and unzip it anywhere, then follow the steps for your OS below.
+
 ## How it behaves
 
 - It reads the operating system's "time since last keyboard or mouse input" counter about once a second.
