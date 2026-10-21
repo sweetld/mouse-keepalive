@@ -1,0 +1,11 @@
+{
+  "_comment": "Restart after editing: python keepalive.py stop, then python keepalive.py start. See README.md for each setting.",
+  "max_wait": 240,
+  "min_wait": 30,
+  "active_hours": "08:00-18:00",
+  "active_days": "mon-fri",
+  "keep_awake": true,
+  "return_pointer": true,
+  "pause_when_locked": true,
+  "nudge_pixels": 3
+}
