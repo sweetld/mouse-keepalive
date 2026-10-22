@@ -2,7 +2,7 @@
 
 Moves the mouse pointer a few pixels now and then while you're away, so screensavers, screen locks, VPN sessions and remote-desktop/VM sessions don't time out. It leaves you alone while you're working.
 
-It's a single Python file, `keepalive.py`, that runs on Windows and macOS. It needs Python 3.8 or later and nothing else.
+It's a single Python file, `keepalive.py`, that runs on Windows, macOS and Linux (X11 desktops). It needs Python 3.8 or later and nothing else.
 
 **Download:** get the latest `mouse-keepalive-<version>.zip` from [Releases](https://github.com/sweetld/mouse-keepalive/releases/latest) and unzip it anywhere, then follow the steps for your OS below.
 
@@ -30,7 +30,7 @@ It's a single Python file, `keepalive.py`, that runs on Windows and macOS. It ne
 
 Restart it after editing the file (`stop`, then `start`). Command-line options override the file for one run. See `python keepalive.py --help`; for example: `python keepalive.py start --max-wait 120 --hours always`.
 
-Logs are written to `%LOCALAPPDATA%\MouseKeepAlive\keepalive.log` on Windows and `~/Library/Application Support/MouseKeepAlive/keepalive.log` on macOS.
+Logs are written to `%LOCALAPPDATA%\MouseKeepAlive\keepalive.log` on Windows, `~/Library/Application Support/MouseKeepAlive/keepalive.log` on macOS and `~/.local/state/MouseKeepAlive/keepalive.log` on Linux.
 
 ## Windows
 
@@ -55,6 +55,25 @@ It runs silently under `pythonw.exe`. Login autostart uses your user's `Run` reg
 4. Check the log for "Nudged pointer". If you see an Accessibility warning there instead, the permission isn't in place yet.
 
 Login autostart is a LaunchAgent at `~/Library/LaunchAgents/com.mousekeepalive.plist`.
+
+## Linux
+
+Works in X11 sessions with any desktop (GNOME, KDE Plasma, Cinnamon, MATE, Xfce and others). It uses the X libraries every X11 desktop already has (libX11, libXss, libXtst), so there's nothing to install.
+
+1. Check you're on X11: `echo $XDG_SESSION_TYPE` should print `x11`. If it prints `wayland`, see below.
+2. In a terminal in your desktop session, in this folder, run:
+
+```
+python3 keepalive.py install     # start at every login, and start now
+python3 keepalive.py status
+python3 keepalive.py stop
+python3 keepalive.py start
+python3 keepalive.py uninstall   # remove from login and stop
+```
+
+Login autostart is `~/.config/autostart/mouse-keepalive.desktop`, so it also shows up in your desktop's Startup Applications settings. Screen-lock detection asks the GNOME, Cinnamon, MATE or freedesktop screensaver service over D-Bus (via `gdbus`). If your desktop has none of those, it's treated as never locked. `keep_awake` uses `gnome-session-inhibit` on GNOME and `systemd-inhibit` elsewhere.
+
+**Wayland isn't supported yet.** Wayland doesn't let ordinary apps read the idle time or move the pointer, so the script refuses to start there. Choose an X11 session at the login screen instead (on GNOME, click the gear icon and pick "GNOME on Xorg").
 
 ## Remote desktops / VMs
 

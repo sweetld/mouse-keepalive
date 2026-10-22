@@ -8,7 +8,7 @@ screensaver / screen lock, VPN and remote-desktop sessions don't time out.
   pointer while you are typing or using the mouse.
 * Each nudge is a few pixels, and the pointer is put back where it was. It never
   clicks, types or changes window focus.
-* Windows and macOS. Python 3.8+, standard library only.
+* Windows, macOS and Linux (X11 sessions). Python 3.8+, standard library only.
 
 Usage:
     python keepalive.py start       start in the background (no window)
@@ -42,10 +42,12 @@ SCRIPT = Path(__file__).resolve()
 CONFIG_FILE = SCRIPT.with_name("keepalive.json")
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
 POLL_SECONDS = 1.0
 OFF_HOURS_POLL_SECONDS = 30.0
 DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 MAC_AGENT_LABEL = "com.mousekeepalive"
+LINUX_DESKTOP_FILE = "mouse-keepalive.desktop"
 
 log = logging.getLogger(APP)
 
@@ -421,12 +423,165 @@ class MacPlatform(Platform):
                 os.path.realpath(sys.executable), SCRIPT, SCRIPT)
 
 
+class LinuxPlatform(Platform):
+    """X11 sessions, through libX11, libXss and libXtst, which every X11 desktop ships."""
+
+    LOCK_CHECK_SECONDS = 5.0
+    # D-Bus services that can say whether the screensaver / lock screen is up, tried in order.
+    SCREENSAVERS = [
+        ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver"),
+        ("org.cinnamon.ScreenSaver", "/org/cinnamon/ScreenSaver"),
+        ("org.mate.ScreenSaver", "/org/mate/ScreenSaver"),
+        ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver"),
+    ]
+
+    def __init__(self):
+        import ctypes
+        from ctypes import POINTER, c_char_p, c_int, c_uint, c_ulong, c_void_p
+
+        self.ct = ctypes
+
+        def load(soname):
+            try:
+                return ctypes.CDLL(soname)
+            except OSError:
+                raise RuntimeError(f"couldn't load {soname}; install your distribution's package for it")
+
+        x11, xss, xtst = self.x11, self.xss, self.xtst = (
+            load("libX11.so.6"), load("libXss.so.1"), load("libXtst.so.6"))
+
+        class XScreenSaverInfo(ctypes.Structure):
+            _fields_ = [("window", c_ulong), ("state", c_int), ("kind", c_int),
+                        ("til_or_since", c_ulong), ("idle", c_ulong), ("event_mask", c_ulong)]
+
+        self.XScreenSaverInfo = XScreenSaverInfo
+        x11.XOpenDisplay.argtypes = [c_char_p]
+        x11.XOpenDisplay.restype = c_void_p
+        x11.XDefaultRootWindow.argtypes = [c_void_p]
+        x11.XDefaultRootWindow.restype = c_ulong
+        x11.XQueryPointer.argtypes = [c_void_p, c_ulong, POINTER(c_ulong), POINTER(c_ulong), POINTER(c_int),
+                                      POINTER(c_int), POINTER(c_int), POINTER(c_int), POINTER(c_uint)]
+        x11.XQueryPointer.restype = c_int
+        x11.XFlush.argtypes = [c_void_p]
+        x11.XFlush.restype = c_int
+        xss.XScreenSaverQueryExtension.argtypes = [c_void_p, POINTER(c_int), POINTER(c_int)]
+        xss.XScreenSaverQueryExtension.restype = c_int
+        xss.XScreenSaverQueryInfo.argtypes = [c_void_p, c_ulong, POINTER(XScreenSaverInfo)]
+        xss.XScreenSaverQueryInfo.restype = c_int
+        xtst.XTestQueryExtension.argtypes = [c_void_p, POINTER(c_int), POINTER(c_int), POINTER(c_int), POINTER(c_int)]
+        xtst.XTestQueryExtension.restype = c_int
+        xtst.XTestFakeMotionEvent.argtypes = [c_void_p, c_int, c_int, c_int, c_ulong]
+        xtst.XTestFakeMotionEvent.restype = c_int
+
+        self.display = x11.XOpenDisplay(None)
+        if not self.display:
+            raise RuntimeError(f"couldn't open X display {os.environ.get('DISPLAY')!r}")
+        self.root = x11.XDefaultRootWindow(self.display)
+        scratch = [c_int() for _ in range(4)]
+        if not xss.XScreenSaverQueryExtension(self.display, *map(ctypes.byref, scratch[:2])):
+            raise RuntimeError("the X server has no MIT-SCREEN-SAVER extension, so idle time can't be read")
+        if not xtst.XTestQueryExtension(self.display, *map(ctypes.byref, scratch)):
+            raise RuntimeError("the X server has no XTEST extension, so the pointer can't be moved")
+
+        self.screensaver = None  # the SCREENSAVERS entry that answered last time
+        self.locked = False
+        self.lock_checked_at = -self.LOCK_CHECK_SECONDS
+        self.inhibitor = None
+
+    def idle_seconds(self) -> float:
+        info = self.XScreenSaverInfo()
+        if not self.xss.XScreenSaverQueryInfo(self.display, self.root, self.ct.byref(info)):
+            return 0.0  # unknown: treat as "you're active" so we stay out of the way
+        return info.idle / 1000.0
+
+    def cursor_pos(self):
+        ct = self.ct
+        root, child = ct.c_ulong(), ct.c_ulong()
+        x, y, win_x, win_y = (ct.c_int() for _ in range(4))
+        mask = ct.c_uint()
+        if not self.x11.XQueryPointer(self.display, self.root, *map(ct.byref, (root, child, x, y, win_x, win_y, mask))):
+            return None  # pointer is on another X screen
+        return x.value, y.value
+
+    def move_to(self, x, y) -> bool:
+        # XTest goes through the X server's normal input path, so like real movement it
+        # resets the idle timer and reaches remote-desktop clients.
+        ok = self.xtst.XTestFakeMotionEvent(self.display, -1, int(round(x)), int(round(y)), 0)
+        self.x11.XFlush(self.display)
+        return bool(ok)
+
+    def is_locked(self) -> bool:
+        # Asking costs a gdbus process, so don't do it on every one-second poll.
+        if time.monotonic() - self.lock_checked_at >= self.LOCK_CHECK_SECONDS:
+            self.lock_checked_at = time.monotonic()
+            self.locked = self._screensaver_active()
+        return self.locked
+
+    def _screensaver_active(self) -> bool:
+        for name, path in ([self.screensaver] if self.screensaver else self.SCREENSAVERS):
+            try:
+                out = subprocess.run(
+                    ["gdbus", "call", "--session", "--dest", name, "--object-path", path,
+                     "--method", f"{name}.GetActive"],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if out.returncode == 0:
+                self.screensaver = (name, path)
+                return "true" in out.stdout
+        self.screensaver = None
+        return False  # no screensaver we know how to ask
+
+    def set_keep_awake(self, on: bool) -> None:
+        if on and self.inhibitor is None:
+            # An inhibitor lasts as long as the command it runs. This one ends a few
+            # seconds after we do, even if we're killed.
+            wait_for_us = ["sh", "-c", f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 5; done"]
+            if "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+                # GNOME blanks the screen according to gnome-session's inhibitors, not logind's.
+                cmd = ["gnome-session-inhibit", "--app-id", "mouse-keepalive", "--reason", "Keeping the session alive",
+                       "--inhibit", "idle:suspend", *wait_for_us]
+            else:
+                cmd = ["systemd-inhibit", "--what=idle:sleep", f"--who={APP}", "--why=Keeping the session alive",
+                       *wait_for_us]
+            try:
+                self.inhibitor = subprocess.Popen(
+                    cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
+            except OSError as e:
+                log.warning("Couldn't ask the desktop to stay awake (%s); relying on the nudges alone.", e)
+        elif not on and self.inhibitor is not None:
+            try:
+                os.killpg(self.inhibitor.pid, signal.SIGTERM)  # the inhibitor and its shell loop
+                self.inhibitor.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            self.inhibitor = None
+
+
+def unsupported_reason() -> Optional[str]:
+    """Why this session can't be kept alive, or None if it can."""
+    if IS_WIN or IS_MAC:
+        return None
+    if not IS_LINUX:
+        return "Sorry, only Windows, macOS and Linux (X11) are supported."
+    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        return ("Wayland sessions aren't supported yet: Wayland doesn't let ordinary apps read idle time or move "
+                "the pointer. Choose an X11 session at the login screen (e.g. 'GNOME on Xorg') to use this.")
+    if not os.environ.get("DISPLAY"):
+        return "No X11 display found (DISPLAY isn't set). Run this from a terminal in your desktop session."
+    return None
+
+
 def get_platform() -> Platform:
+    reason = unsupported_reason()
+    if reason:
+        raise RuntimeError(reason)
     if IS_WIN:
         return WindowsPlatform()
     if IS_MAC:
         return MacPlatform()
-    raise SystemExit("Sorry, only Windows and macOS are supported.")
+    return LinuxPlatform()
 
 
 # ----------------------------------------------------------------------------- core
@@ -585,6 +740,10 @@ def python_for_background() -> str:
 
 def cmd_run(cfg: Config, verbose: bool) -> int:
     setup_logging(verbose, console=True)
+    reason = unsupported_reason()
+    if reason:
+        log.error(reason)
+        return 1
     lock = InstanceLock()
     if not lock.acquire():
         log.info("Already running (pid %s); nothing to do.", running_pid() or "?")
@@ -638,7 +797,8 @@ def cmd_stop() -> int:
         print("Not running.")
         return 0
     if not pid:
-        print("It's running but its PID file is missing; stop it from Task Manager / Activity Monitor.")
+        print("It's running but its PID file is missing; stop it from Task Manager / Activity Monitor "
+              "(on Linux: pkill -f keepalive.py).")
         return 1
     try:
         os.kill(pid, signal.SIGTERM)
@@ -661,6 +821,18 @@ def mac_agent_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{MAC_AGENT_LABEL}.plist"
 
 
+def linux_autostart_path() -> Path:
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return config / "autostart" / LINUX_DESKTOP_FILE
+
+
+def desktop_exec_arg(arg: str) -> str:
+    """Quote one argument for a .desktop file's Exec= line: the Exec quoting rules, then
+    the file format's own backslash escaping on top."""
+    quoted = '"' + "".join("\\" + c if c in '"`$\\' else c for c in arg) + '"'
+    return quoted.replace("\\", "\\\\").replace("%", "%%")
+
+
 def autostart_installed() -> bool:
     if IS_WIN:
         import winreg
@@ -670,7 +842,9 @@ def autostart_installed() -> bool:
             return True
         except OSError:
             return False
-    return mac_agent_path().exists()
+    if IS_MAC:
+        return mac_agent_path().exists()
+    return linux_autostart_path().exists()
 
 
 def cmd_install() -> int:
@@ -701,7 +875,20 @@ def cmd_install() -> int:
             return cmd_start([])
         print(f"Running. Log: {log_path()}")
         return 0
-    raise SystemExit("Sorry, only Windows and macOS are supported.")
+    # Linux: an XDG autostart entry, which every desktop runs at login with the session's DISPLAY.
+    path = linux_autostart_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    command = " ".join(desktop_exec_arg(a) for a in (python_for_background(), str(SCRIPT), "run"))
+    path.write_text(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Mouse keep-alive\n"
+        "Comment=Nudges the mouse while you're idle to keep the screen, VPN and remote sessions alive\n"
+        f"Exec={command}\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n", encoding="utf-8")
+    print(f"Will start automatically when you log in ({path}).")
+    return cmd_start([])
 
 
 def cmd_uninstall() -> int:
@@ -718,6 +905,11 @@ def cmd_uninstall() -> int:
             mac_agent_path().unlink()
         except FileNotFoundError:
             pass
+    else:
+        try:
+            linux_autostart_path().unlink()
+        except FileNotFoundError:
+            pass
     print("Removed from login items.")
     return cmd_stop()
 
@@ -729,6 +921,9 @@ def cmd_status(cfg: Config) -> int:
     print("Settings:  " + cfg.describe())
     print(f"Config:    {CONFIG_FILE}" + ("" if CONFIG_FILE.exists() else " (not found, using defaults)"))
     print(f"Log:       {log_path()}")
+    reason = unsupported_reason()
+    if reason:
+        print(f"Problem:   {reason}")
     if IS_MAC:
         trusted = MacPlatform().accessibility_trusted()
         print("Accessibility (this Python, as launched from here): " + ("granted" if trusted else "NOT granted"))
@@ -761,6 +956,9 @@ def main(argv=None) -> int:
         print(f"Config problem: {e}", file=sys.stderr)
         return 2
 
+    if args.command in ("start", "install") and unsupported_reason():
+        print(unsupported_reason(), file=sys.stderr)
+        return 1
     if args.command == "run":
         return cmd_run(cfg, args.verbose)
     if args.command == "start":
